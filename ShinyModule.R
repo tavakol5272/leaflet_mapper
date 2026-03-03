@@ -9,6 +9,7 @@ library(webshot2)
 library(shinycssloaders)
 library(shinybusy)
 
+`%||%` <- function(x, y) if (is.null(x)) y else x
 
 # helper1: move track attributes to event
 as_event <- function(mv, attr_names) {
