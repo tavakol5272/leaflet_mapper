@@ -90,235 +90,282 @@ shinyModuleUserInterface <- function(id, label) {
 shinyModule <- function(input, output, session, data) {
   
   ns <- session$ns
-  dataObj <- reactive({ data })
-  current <- reactiveVal(data)
+  dbg <- function(...) message(sprintf("[LMAP] %s", sprintf(...)))
+  
+  # ---- Make sure artifacts dir exists (local SDK safety) ----
+  art_dir <- Sys.getenv("APP_ARTIFACTS_DIR", unset = "./data/output")
+  dir.create(art_dir, recursive = TRUE, showWarnings = FALSE)
+  dbg("APP_ARTIFACTS_DIR=%s", normalizePath(art_dir, winslash = "/", mustWork = FALSE))
+  
   locked_settings <- reactiveVal(NULL)
-  locked_data <- reactiveVal(NULL)
+  locked_data     <- reactiveVal(NULL)
+  
+  # This is what MoveApps should store to output.rds
+  current <- reactiveVal(NULL)
   
   apply_warning <- reactiveVal(FALSE)
   output$apply_warning <- renderUI({
     if (isTRUE(apply_warning())) {
-      logger.info("No track selected.")
       div(style = "color:#b30000; font-weight:800; margin-top:6px;", "No track selected")
-    } else {
-      NULL
-    }
+    } else NULL
   })
   
+  dbg("shinyModule started.")
   if (is.null(data) || nrow(data) == 0) {
-    message("Input is NULL or has 0 rows — returning NULL.")
-    return(NULL)
+    dbg("ERROR: data is NULL or 0 rows -> returning NULL.")
+    return(reactive(NULL))
   }
   
-  if (!sf::st_is_longlat(data)) data <- sf::st_transform(data, 4326)
+  dbg("Input rows: %d", nrow(data))
+  if (!sf::st_is_longlat(data)) {
+    dbg("Transforming to EPSG:4326")
+    data <- sf::st_transform(data, 4326)
+  } else {
+    dbg("Data already lon/lat.")
+  }
   
   track_col <- mt_track_id_column(data)
- 
+  dbg("Track id column detected: %s", track_col)
   
-  ###### add this part : start ###################
-  ############ create animal and attribute input- bookmark safe ############# 
+  # ---------- helpers ----------
+  all_ids_vec <- sort(unique(as.character(data[[track_col]])))
+  if (!length(all_ids_vec)) dbg("WARNING: no track ids found!")
   
-  # Checks the URL for `_state_id_=` to detect a bookmark restore:TRUE=restore, FALSE=normal run
-  restoring <- reactive({
-    qs <- session$clientData$url_search %||% ""
-    grepl("_state_id_=", qs, fixed = TRUE)
+  selected_data <- reactive({
+    sel <- input$animals
+    if (is.null(sel)) sel <- all_ids_vec
+    if (!length(sel)) return(data[0, ])
+    d <- data[data[[track_col]] %in% sel, ]
+    dbg("selected_data | animals=%d | rows=%d", length(sel), nrow(d))
+    d
   })
   
-  all_ids <- reactive({
-    sort(unique(as.character(data[[track_col]])))
-  })
-  
-  #create animals input
+  # ---------- bookmark-safe UI creators ----------
   output$animals_ui <- renderUI({
-    ids <- all_ids()
-    req(length(ids) > 0)
-    args <- list( inputId = ns("animals"),label   = NULL, choices = ids )
-    if (!isTRUE(restoring())) args$selected <- ids     #fresh run: default select all
-    do.call(checkboxGroupInput, args)       #restore from input
+    restored_sel <- isolate(input$animals)
+    sel <- if (!is.null(restored_sel)) restored_sel else all_ids_vec
+    dbg("Render animals_ui | choices=%d | selected=%d", length(all_ids_vec), length(sel))
+    checkboxGroupInput(ns("animals"), label = NULL, choices = all_ids_vec, selected = sel)
   })
   
-  #create attribute input 
   attr_choices_all <- reactive({
     td <- mt_track_data(data)
-    track_choices <- character(0)
-    if (!is.null(td) && ncol(td) > 0) track_choices <- names(td)
-    
+    track_choices <- if (!is.null(td) && ncol(td) > 0) names(td) else character(0)
     d2 <- as_event(data, track_choices)
     event_attr <- sf::st_drop_geometry(d2)
-    
     choices <- names(event_attr)[vapply(event_attr, function(x) any(!is.na(x)), logical(1))]
-    sort(unique(choices))
+    choices <- sort(unique(choices))
+    dbg("attr_choices_all computed | %d choices", length(choices))
+    choices
   })
   
   output$select_attr_ui <- renderUI({
-    selectInput(ns("select_attr"),"Optionally: Select other attributes to show in the pop-up at each point (multiple can be selected):",choices = attr_choices_all(), multiple = TRUE)
+    ch <- attr_choices_all()
+    restored_attr <- isolate(input$select_attr) %||% character(0)
+    restored_attr <- intersect(restored_attr, ch)
+    dbg("Render select_attr_ui | choices=%d | selected=%d", length(ch), length(restored_attr))
+    selectInput(
+      ns("select_attr"),
+      "Optionally: Select other attributes to show in the pop-up at each point (multiple can be selected):",
+      choices = ch,
+      selected = restored_attr,
+      multiple = TRUE
+    )
   })
- ############## End  ################################
   
   observeEvent(input$select_all_animals, {
-    updateCheckboxGroupInput(session, "animals", selected = all_ids())
+    dbg("Clicked: Select All Animals")
+    updateCheckboxGroupInput(session, "animals", selected = all_ids_vec)
   }, ignoreInit = TRUE)
   
   observeEvent(input$unselect_animals, {
+    dbg("Clicked: Unselect All Animals")
     updateCheckboxGroupInput(session, "animals", selected = character(0))
   }, ignoreInit = TRUE)
   
-  # Filtered data (selected animals)
-  selected_data <- reactive({
-    req(input$animals)
-    d <- data
-    d[d[[track_col]] %in% input$animals, ]
-  })
+  # ---------- init (bookmark-safe) ----------
+  init_done <- reactiveVal(FALSE)
   
-  # initialize
-  observe({
-    if (!is.null(locked_data())) return()
-    d0 <- selected_data()
-    req(nrow(d0) > 0)
-    locked_data(d0)
-    locked_settings(list(animals = input$animals, select_attr = input$select_attr))
-  })
-  
-  ###############
-  
-  # attribute choices (update immediately when tracks change)
   observeEvent(input$animals, {
+    if (isTRUE(init_done())) return()
+    if (is.null(input$animals)) return()
     
+    d0 <- selected_data()
+    if (nrow(d0) == 0) return()
+    
+    locked_data(d0)
+    locked_settings(list(
+      animals = input$animals,
+      select_attr = input$select_attr %||% character(0)
+    ))
+    
+    # IMPORTANT for MoveApps output.rds:
+    current(d0)
+    
+    init_done(TRUE)
+    dbg("INIT done | locked rows=%d | animals=%d | attrs=%d",
+        nrow(d0), length(input$animals), length(input$select_attr %||% character(0)))
+  }, ignoreInit = FALSE)
+  
+  # keep attr selection valid when animals change
+  observeEvent(input$animals, {
     d <- selected_data()
-    req(nrow(d) > 0)
-    
-    # Track attributes
-    td <- mt_track_data(d)
-    track_choices <- character(0)
-    if (!is.null(td) && ncol(td) > 0) {
-      track_choices <- names(td)
+    if (nrow(d) == 0) {
+      dbg("Animals changed -> empty selection.")
+      return()
     }
     
-    # Convert all track attrs to event
+    td <- mt_track_data(d)
+    track_choices <- if (!is.null(td) && ncol(td) > 0) names(td) else character(0)
+    
     d2 <- as_event(d, track_choices)
-    
     event_attr <- sf::st_drop_geometry(d2)
-    
-    # Keep only attrs that have at least one non-NA
     choices <- names(event_attr)[vapply(event_attr, function(x) any(!is.na(x)), logical(1))]
     choices <- sort(unique(choices))
     
-    # keep previous selection if still valid
-    prev <- isolate(input$select_attr)
-    sel  <- if (!is.null(prev)) intersect(prev, choices) else NULL
+    prev <- isolate(input$select_attr) %||% character(0)
+    sel  <- intersect(prev, choices)
     
+    dbg("updateSelectInput(select_attr) | choices=%d | keep_selected=%d", length(choices), length(sel))
     updateSelectInput(session, "select_attr", choices = choices, selected = sel)
-    
   }, ignoreInit = FALSE)
   
-  ##############################################
-  
-  # Apply button
+  # Apply button locks what the map shows
   observeEvent(input$apply_btn, {
-    # if no track selected, not change map
+    dbg("Clicked: Apply Changes")
+    
     if (is.null(input$animals) || length(input$animals) == 0) {
+      dbg("Apply blocked: no animals selected.")
       apply_warning(TRUE)
       return()
     }
     
     apply_warning(FALSE)
-    locked_data(selected_data())
-    locked_settings(list(animals = input$animals, select_attr = input$select_attr))
+    d_applied <- selected_data()
+    
+    locked_data(d_applied)
+    locked_settings(list(
+      animals = input$animals,
+      select_attr = input$select_attr %||% character(0)
+    ))
+    
+    # IMPORTANT for MoveApps output.rds:
+    current(d_applied)
+    
+    dbg("Apply ok -> locked rows=%d", nrow(d_applied))
   }, ignoreInit = TRUE)
   
-  # Lines
+  # ---------- Map ----------
   track_lines <- reactive({
-    d <- locked_data()
-    req(d)
-    req(nrow(d) >= 2)
-    mt_track_lines(d)
+    d <- locked_data() %||% selected_data()
+    if (is.null(d) || nrow(d) < 2) return(NULL)
+    
+    tryCatch(mt_track_lines(d), error = function(e) {
+      dbg("ERROR mt_track_lines(): %s", e$message)
+      NULL
+    })
   })
   
   mmap <- reactive({
-    d <- locked_data()
-    req(d)
-    req(nrow(d) >= 1)
+    d <- locked_data() %||% selected_data()
     
-    bounds <- as.vector(sf::st_bbox(d))
+    if (is.null(d) || nrow(d) == 0) {
+      dbg("mmap: empty -> base map only")
+      return(leaflet() %>% addProviderTiles("OpenStreetMap"))
+    }
+    
+    s <- locked_settings() %||% list(select_attr = character(0))
+    attr_sel <- s$select_attr %||% character(0)
+    
     ids <- sort(unique(as.character(d[[track_col]])))
     pal <- colorFactor(palette = pals::glasbey(), domain = ids)
     
-    # colors for points
     d$col <- pal(as.character(d[[track_col]]))
-    
-    # Build lines
-    tl <- track_lines()
-    tl$col <- pal(as.character(tl[[track_col]]))
-    
-    s <- locked_settings()
-    attr_sel <- if (!is.null(s) && !is.null(s$select_attr)) s$select_attr else character(0)
-    
-    if (length(attr_sel)) d <- as_event(d, attr_sel)  # track to event
+    if (length(attr_sel)) d <- as_event(d, attr_sel)
     d$popup_html <- make_popup(d, track_col, attr_sel)
     
-    leaflet(options = leafletOptions(minZoom = 2)) %>%
+    bounds <- as.vector(sf::st_bbox(d))
+    
+    m <- leaflet(options = leafletOptions(minZoom = 2)) %>%
       fitBounds(bounds[1], bounds[2], bounds[3], bounds[4]) %>%
       addProviderTiles("OpenStreetMap", group = "OpenStreetMap") %>%
       addProviderTiles("Esri.WorldTopoMap", group = "TopoMap") %>%
       addProviderTiles("Esri.WorldImagery", group = "Aerial") %>%
       addScaleBar(position = "topleft") %>%
-      addCircleMarkers(data = d, radius = 1, opacity = 0.7, fillOpacity = 0.5,
-                       color = ~col, popup = ~popup_html, group = "Points") %>%
-      addPolylines(data = tl, weight = 3, opacity = 0.5,
-                   color = ~col, group = "Lines") %>%
-      addLegend(position = "bottomright", pal = pal, values = ids, title = "Tracks", opacity = 0.8,group = "Legend") %>%
-      addLayersControl(baseGroups = c("OpenStreetMap", "TopoMap", "Aerial"),
-                       overlayGroups = c("Lines", "Points", "Legend"),
-                       options = layersControlOptions(collapsed = FALSE))
+      addCircleMarkers(
+        data = d, radius = 1, opacity = 0.7, fillOpacity = 0.5,
+        color = ~col, popup = ~popup_html, group = "Points"
+      )
+    
+    tl <- track_lines()
+    if (!is.null(tl) && nrow(tl) > 0) {
+      tl$col <- pal(as.character(tl[[track_col]]))
+      m <- m %>% addPolylines(data = tl, weight = 3, opacity = 0.5, color = ~col, group = "Lines")
+    } else {
+      dbg("mmap: no lines layer")
+    }
+    
+    m %>%
+      addLegend(position = "bottomright", pal = pal, values = ids,
+                title = "Tracks", opacity = 0.8, group = "Legend") %>%
+      addLayersControl(
+        baseGroups = c("OpenStreetMap", "TopoMap", "Aerial"),
+        overlayGroups = c("Lines", "Points", "Legend"),
+        options = layersControlOptions(collapsed = FALSE)
+      )
   })
   
-  ########################################
-  # Auto-save map for all individuals
+  output$leafmap <- renderLeaflet({
+    dbg("renderLeaflet called.")
+    mmap()
+  })
   
+  # ---------- MoveApps artifact autosave ----------
   saved_html <- reactiveVal(FALSE)
   
   observe({
+    req(init_done())
     if (saved_html()) return()
     
-    d <- selected_data()
-    req(nrow(d) > 0)
+    out_file <- appArtifactPath("autosave_leaflet_mapper.html")
+    dbg("Autosave artifact -> %s", out_file)
     
-    htmlwidgets::saveWidget(widget = isolate(mmap()),
-                            file = "./data/output/autosave_leaflet_mapper.html",
-                            selfcontained = FALSE)
-    saved_html(TRUE)
+    tryCatch({
+      htmlwidgets::saveWidget(
+        widget = isolate(mmap()),
+        file = out_file,
+        selfcontained = TRUE  # IMPORTANT: avoid creating *_files folders in artifacts dir
+      )
+      saved_html(TRUE)
+      dbg("Autosave artifact success.")
+    }, error = function(e) {
+      dbg("ERROR autosave saveWidget(): %s", e$message)
+    })
   })
   
-  ######################################
-  
-  output$leafmap <- renderLeaflet(mmap())
-  
-  #### download HTML
+  # downloads (browser)
   output$save_html <- downloadHandler(
     filename = function() paste0("LeafletMap_", Sys.Date(), ".html"),
     content = function(file) {
-      
-      show_modal_spinner(spin = "fading-circle", text = "Saving HTML…")
-      on.exit(remove_modal_spinner(), add = TRUE)
-      
-      saveWidget(widget = mmap(), file = file)
+      dbg("Download HTML -> %s", file)
+      saveWidget(isolate(mmap()), file = file, selfcontained = TRUE)
     }
   )
   
-  #### save map as PNG
   output$save_png <- downloadHandler(
-    filename = paste0("LeafletMap_", Sys.Date(), ".png"),
+    filename = function() paste0("LeafletMap_", Sys.Date(), ".png"),
     content = function(file) {
-      
-      show_modal_spinner(spin = "fading-circle", text = "Saving PNG…")
-      on.exit(remove_modal_spinner(), add = TRUE)
-      
-      html_file <- "leaflet_export.html"
-      saveWidget(mmap(), file = html_file, selfcontained = TRUE)
+      dbg("Download PNG -> %s", file)
+      html_file <- tempfile(fileext = ".html")
+      saveWidget(isolate(mmap()), file = html_file, selfcontained = TRUE)
       Sys.sleep(2)
       webshot(url = html_file, file = file, vwidth = 1000, vheight = 800)
     }
   )
   
-  return(reactive({ current() }))
+  # MoveApps will store current() into output.rds
+  return(reactive({
+    req(current())
+    current()
+  }))
 }
