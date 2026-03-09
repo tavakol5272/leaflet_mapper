@@ -1,4 +1,3 @@
-###final version (same logic, just using renderUI strategy for bookmark-safe restore)
 library(shiny)
 library(move2)
 library(sf)
@@ -8,6 +7,7 @@ library(htmlwidgets)
 library(webshot2)
 library(shinycssloaders)
 library(shinybusy)
+library(zip)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
@@ -90,61 +90,74 @@ shinyModuleUserInterface <- function(id, label) {
 shinyModule <- function(input, output, session, data) {
   
   ns <- session$ns
-  dbg <- function(...) message(sprintf("[LMAP] %s", sprintf(...)))
-  
-  # ---- Make sure artifacts dir exists (local SDK safety) ----
-  art_dir <- Sys.getenv("APP_ARTIFACTS_DIR", unset = "./data/output")
-  dir.create(art_dir, recursive = TRUE, showWarnings = FALSE)
-  dbg("APP_ARTIFACTS_DIR=%s", normalizePath(art_dir, winslash = "/", mustWork = FALSE))
   
   locked_settings <- reactiveVal(NULL)
   locked_data     <- reactiveVal(NULL)
   
-  # This is what MoveApps should store to output.rds
   current <- reactiveVal(NULL)
   
+  ###########
+  save_artifact_map <- function() {
+    targetDirFiles <- file.path(tempdir(), "leaflet_mapper_zip")
+    unlink(targetDirFiles, recursive = TRUE, force = TRUE)
+    dir.create(targetDirFiles, recursive = TRUE, showWarnings = FALSE)
+    
+    html_file <- file.path(targetDirFiles, "autosave_leaflet_mapper.html")
+    
+    logger.info("Saving leaflet html bundle -> %s", targetDirFiles)
+    
+    htmlwidgets::saveWidget(
+      widget = isolate(mmap()),
+      file = html_file,
+      selfcontained = FALSE
+    )
+    
+    zip_file <- appArtifactPath("autosave_leaflet_mapper.zip")
+    
+    zip::zip(
+      zipfile = zip_file,
+      files = list.files(targetDirFiles, full.names = TRUE),
+      mode = "cherry-pick"
+    )
+    
+    logger.info("Artifact zip success -> %s", zip_file)
+  }
+  #############
   apply_warning <- reactiveVal(FALSE)
   output$apply_warning <- renderUI({
     if (isTRUE(apply_warning())) {
+      logger.info("No track selected.")
       div(style = "color:#b30000; font-weight:800; margin-top:6px;", "No track selected")
-    } else NULL
+    } else {
+      NULL
+    }
   })
   
-  dbg("shinyModule started.")
   if (is.null(data) || nrow(data) == 0) {
-    dbg("ERROR: data is NULL or 0 rows -> returning NULL.")
-    return(reactive(NULL))
+    message("Input is NULL or has 0 rows — returning NULL.")
+    return(NULL)
   }
   
-  dbg("Input rows: %d", nrow(data))
-  if (!sf::st_is_longlat(data)) {
-    dbg("Transforming to EPSG:4326")
-    data <- sf::st_transform(data, 4326)
-  } else {
-    dbg("Data already lon/lat.")
-  }
+  if (!sf::st_is_longlat(data)) data <- sf::st_transform(data, 4326)
   
   track_col <- mt_track_id_column(data)
-  dbg("Track id column detected: %s", track_col)
   
-  # ---------- helpers ----------
   all_ids_vec <- sort(unique(as.character(data[[track_col]])))
-  if (!length(all_ids_vec)) dbg("WARNING: no track ids found!")
+  if (!length(all_ids_vec)) logger.info(" no track ids found!")
   
   selected_data <- reactive({
     sel <- input$animals
     if (is.null(sel)) sel <- all_ids_vec
     if (!length(sel)) return(data[0, ])
     d <- data[data[[track_col]] %in% sel, ]
-    dbg("selected_data | animals=%d | rows=%d", length(sel), nrow(d))
     d
   })
   
-  # ---------- bookmark-safe UI creators ----------
+  # #create animals input
   output$animals_ui <- renderUI({
     restored_sel <- isolate(input$animals)
     sel <- if (!is.null(restored_sel)) restored_sel else all_ids_vec
-    dbg("Render animals_ui | choices=%d | selected=%d", length(all_ids_vec), length(sel))
+    logger.info("animals_ui | choices=%d | selected=%d", length(all_ids_vec), length(sel))
     checkboxGroupInput(ns("animals"), label = NULL, choices = all_ids_vec, selected = sel)
   })
   
@@ -155,7 +168,7 @@ shinyModule <- function(input, output, session, data) {
     event_attr <- sf::st_drop_geometry(d2)
     choices <- names(event_attr)[vapply(event_attr, function(x) any(!is.na(x)), logical(1))]
     choices <- sort(unique(choices))
-    dbg("attr_choices_all computed | %d choices", length(choices))
+    logger.info("attr_choices_all computed | %d choices", length(choices))
     choices
   })
   
@@ -163,7 +176,7 @@ shinyModule <- function(input, output, session, data) {
     ch <- attr_choices_all()
     restored_attr <- isolate(input$select_attr) %||% character(0)
     restored_attr <- intersect(restored_attr, ch)
-    dbg("Render select_attr_ui | choices=%d | selected=%d", length(ch), length(restored_attr))
+    logger.info("Render select_attr_ui | choices=%d | selected=%d", length(ch), length(restored_attr))
     selectInput(
       ns("select_attr"),
       "Optionally: Select other attributes to show in the pop-up at each point (multiple can be selected):",
@@ -174,16 +187,14 @@ shinyModule <- function(input, output, session, data) {
   })
   
   observeEvent(input$select_all_animals, {
-    dbg("Clicked: Select All Animals")
     updateCheckboxGroupInput(session, "animals", selected = all_ids_vec)
   }, ignoreInit = TRUE)
   
   observeEvent(input$unselect_animals, {
-    dbg("Clicked: Unselect All Animals")
     updateCheckboxGroupInput(session, "animals", selected = character(0))
   }, ignoreInit = TRUE)
   
-  # ---------- init (bookmark-safe) ----------
+  ## initialize
   init_done <- reactiveVal(FALSE)
   
   observeEvent(input$animals, {
@@ -199,11 +210,17 @@ shinyModule <- function(input, output, session, data) {
       select_attr = input$select_attr %||% character(0)
     ))
     
-    # IMPORTANT for MoveApps output.rds:
+    
+    tryCatch({
+      save_artifact_map()
+    }, error = function(e) {
+      logger.info("Artifact save failed on init: %s", e$message)
+    })
+    
     current(d0)
     
     init_done(TRUE)
-    dbg("INIT done | locked rows=%d | animals=%d | attrs=%d",
+    logger.info("INIT done | locked rows=%d | animals=%d | attrs=%d",
         nrow(d0), length(input$animals), length(input$select_attr %||% character(0)))
   }, ignoreInit = FALSE)
   
@@ -211,7 +228,7 @@ shinyModule <- function(input, output, session, data) {
   observeEvent(input$animals, {
     d <- selected_data()
     if (nrow(d) == 0) {
-      dbg("Animals changed -> empty selection.")
+      logger.info("Animals changed so empty selection.")
       return()
     }
     
@@ -226,16 +243,15 @@ shinyModule <- function(input, output, session, data) {
     prev <- isolate(input$select_attr) %||% character(0)
     sel  <- intersect(prev, choices)
     
-    dbg("updateSelectInput(select_attr) | choices=%d | keep_selected=%d", length(choices), length(sel))
+    logger.info("updateSelectInput(select_attr) | choices=%d | keep_selected=%d", length(choices), length(sel))
     updateSelectInput(session, "select_attr", choices = choices, selected = sel)
   }, ignoreInit = FALSE)
   
   # Apply button locks what the map shows
   observeEvent(input$apply_btn, {
-    dbg("Clicked: Apply Changes")
     
     if (is.null(input$animals) || length(input$animals) == 0) {
-      dbg("Apply blocked: no animals selected.")
+      logger.info("Apply blocked: no animals selected.")
       apply_warning(TRUE)
       return()
     }
@@ -250,27 +266,30 @@ shinyModule <- function(input, output, session, data) {
     ))
     
     # IMPORTANT for MoveApps output.rds:
-    current(d_applied)
+    tryCatch({
+      save_artifact_map()
+    }, error = function(e) {
+      logger.info("Artifact save failed on apply: %s", e$message)
+    })
     
-    dbg("Apply ok -> locked rows=%d", nrow(d_applied))
+    current(d_applied)
+    logger.info("Apply ok -> locked rows=%d", nrow(d_applied))
+    
   }, ignoreInit = TRUE)
   
-  # ---------- Map ----------
+  ####### Map ######
   track_lines <- reactive({
     d <- locked_data() %||% selected_data()
+    req(d)
     if (is.null(d) || nrow(d) < 2) return(NULL)
-    
-    tryCatch(mt_track_lines(d), error = function(e) {
-      dbg("ERROR mt_track_lines(): %s", e$message)
-      NULL
-    })
+    mt_track_lines(d)
   })
   
   mmap <- reactive({
     d <- locked_data() %||% selected_data()
     
     if (is.null(d) || nrow(d) == 0) {
-      dbg("mmap: empty -> base map only")
+      logger.info("mmap: empty -> base map only")
       return(leaflet() %>% addProviderTiles("OpenStreetMap"))
     }
     
@@ -302,7 +321,7 @@ shinyModule <- function(input, output, session, data) {
       tl$col <- pal(as.character(tl[[track_col]]))
       m <- m %>% addPolylines(data = tl, weight = 3, opacity = 0.5, color = ~col, group = "Lines")
     } else {
-      dbg("mmap: no lines layer")
+      logger.info("mmap: no lines layer")
     }
     
     m %>%
@@ -316,46 +335,24 @@ shinyModule <- function(input, output, session, data) {
   })
   
   output$leafmap <- renderLeaflet({
-    dbg("renderLeaflet called.")
     mmap()
   })
   
-  # ---------- MoveApps artifact autosave ----------
-  saved_html <- reactiveVal(FALSE)
   
-  observe({
-    req(init_done())
-    if (saved_html()) return()
-    
-    out_file <- appArtifactPath("autosave_leaflet_mapper.html")
-    dbg("Autosave artifact -> %s", out_file)
-    
-    tryCatch({
-      htmlwidgets::saveWidget(
-        widget = isolate(mmap()),
-        file = out_file,
-        selfcontained = TRUE  # IMPORTANT: avoid creating *_files folders in artifacts dir
-      )
-      saved_html(TRUE)
-      dbg("Autosave artifact success.")
-    }, error = function(e) {
-      dbg("ERROR autosave saveWidget(): %s", e$message)
-    })
-  })
-  
-  # downloads (browser)
+  #### download HTML
   output$save_html <- downloadHandler(
     filename = function() paste0("LeafletMap_", Sys.Date(), ".html"),
     content = function(file) {
-      dbg("Download HTML -> %s", file)
+      logger.info("Download HTML -> %s", file)
       saveWidget(isolate(mmap()), file = file, selfcontained = TRUE)
     }
   )
   
+  #### save map as PNG
   output$save_png <- downloadHandler(
     filename = function() paste0("LeafletMap_", Sys.Date(), ".png"),
     content = function(file) {
-      dbg("Download PNG -> %s", file)
+      logger.info("Download PNG -> %s", file)
       html_file <- tempfile(fileext = ".html")
       saveWidget(isolate(mmap()), file = html_file, selfcontained = TRUE)
       Sys.sleep(2)
