@@ -47,6 +47,21 @@ make_popup <- function(d, track_col, attrs = character(0)) {
   )
 }
 
+# helper3: get available attribute names directly from track data + event data
+get_attr_choices <- function(mv) {
+  td <- mt_track_data(mv)
+  track_choices <- if (!is.null(td) && ncol(td) > 0) {
+    names(td)[vapply(td, function(x) any(!is.na(x)), logical(1))]
+  } else {
+    character(0)
+  }
+  
+  event_df <- sf::st_drop_geometry(mv)
+  event_choices <- names(event_df)[vapply(event_df, function(x) any(!is.na(x)), logical(1))]
+  
+  sort(unique(c(track_choices, event_choices)))
+}
+
 ########### Interface ##########################
 
 shinyModuleUserInterface <- function(id, label) {
@@ -64,6 +79,10 @@ shinyModuleUserInterface <- function(id, label) {
                      column(6, actionButton(ns("select_all_animals"), "Select All Animals", class = "btn-sm")),
                      column(6, actionButton(ns("unselect_animals"), "Unselect All Animals", class = "btn-sm"))
                    ),
+                   ###
+                   # tracks json friendly format list
+                   tags$div(style = "display:none;", textInput(ns("animals_json"), label = NULL, value = "")),
+                   #######
                    
                    br(),
                    h4("Attributes"),
@@ -102,7 +121,7 @@ shinyModule <- function(input, output, session, data) {
     unlink(targetDirFiles, recursive = TRUE, force = TRUE)
     dir.create(targetDirFiles, recursive = TRUE, showWarnings = FALSE)
     
-    html_file <- file.path(targetDirFiles, "autosave_leaflet_mapper.html")
+    html_file <- file.path(targetDirFiles, "initial_leaflet_mapper.html")
     
     logger.info("Saving leaflet html bundle -> %s", targetDirFiles)
     
@@ -112,7 +131,7 @@ shinyModule <- function(input, output, session, data) {
       selfcontained = FALSE
     )
     
-    zip_file <- appArtifactPath("autosave_leaflet_mapper.zip")
+    zip_file <- appArtifactPath("initial_leaflet_mapper.zip")
     
     zip::zip(
       zipfile = zip_file,
@@ -157,18 +176,14 @@ shinyModule <- function(input, output, session, data) {
   output$animals_ui <- renderUI({
     restored_sel <- isolate(input$animals)
     sel <- if (!is.null(restored_sel)) restored_sel else all_ids_vec
-    logger.info("animals_ui | choices=%d | selected=%d", length(all_ids_vec), length(sel))
+    logger.info("animals_ui , choices=%d , selected=%d", length(all_ids_vec), length(sel))
     checkboxGroupInput(ns("animals"), label = NULL, choices = all_ids_vec, selected = sel)
   })
   
+  # CHANGED: no as_event() here; just collect names from track data + event data
   attr_choices_all <- reactive({
-    td <- mt_track_data(data)
-    track_choices <- if (!is.null(td) && ncol(td) > 0) names(td) else character(0)
-    d2 <- as_event(data, track_choices)
-    event_attr <- sf::st_drop_geometry(d2)
-    choices <- names(event_attr)[vapply(event_attr, function(x) any(!is.na(x)), logical(1))]
-    choices <- sort(unique(choices))
-    logger.info("attr_choices_all computed | %d choices", length(choices))
+    choices <- get_attr_choices(data)
+    logger.info("attr_choices_all computed , %d choices", length(choices))
     choices
   })
   
@@ -176,7 +191,7 @@ shinyModule <- function(input, output, session, data) {
     ch <- attr_choices_all()
     restored_attr <- isolate(input$select_attr) %||% character(0)
     restored_attr <- intersect(restored_attr, ch)
-    logger.info("Render select_attr_ui | choices=%d | selected=%d", length(ch), length(restored_attr))
+    logger.info("Render select_attr_ui , choices=%d , selected=%d", length(ch), length(restored_attr))
     selectInput(
       ns("select_attr"),
       "Optionally: Select other attributes to show in the pop-up at each point (multiple can be selected):",
@@ -220,8 +235,8 @@ shinyModule <- function(input, output, session, data) {
     current(d0)
     
     init_done(TRUE)
-    logger.info("INIT done | locked rows=%d | animals=%d | attrs=%d",
-        nrow(d0), length(input$animals), length(input$select_attr %||% character(0)))
+    logger.info("INIT done , locked rows=%d , animals=%d , attrs=%d",
+                nrow(d0), length(input$animals), length(input$select_attr %||% character(0)))
   }, ignoreInit = FALSE)
   
   # keep attr selection valid when animals change
@@ -232,18 +247,13 @@ shinyModule <- function(input, output, session, data) {
       return()
     }
     
-    td <- mt_track_data(d)
-    track_choices <- if (!is.null(td) && ncol(td) > 0) names(td) else character(0)
-    
-    d2 <- as_event(d, track_choices)
-    event_attr <- sf::st_drop_geometry(d2)
-    choices <- names(event_attr)[vapply(event_attr, function(x) any(!is.na(x)), logical(1))]
-    choices <- sort(unique(choices))
+    # CHANGED: no full as_event() conversion here either
+    choices <- get_attr_choices(d)
     
     prev <- isolate(input$select_attr) %||% character(0)
     sel  <- intersect(prev, choices)
     
-    logger.info("updateSelectInput(select_attr) | choices=%d | keep_selected=%d", length(choices), length(sel))
+    logger.info("updateSelectInput(select_attr) ,choices=%d , keep_selected=%d", length(choices), length(sel))
     updateSelectInput(session, "select_attr", choices = choices, selected = sel)
   }, ignoreInit = FALSE)
   
@@ -265,15 +275,9 @@ shinyModule <- function(input, output, session, data) {
       select_attr = input$select_attr %||% character(0)
     ))
     
-    # IMPORTANT for MoveApps output.rds:
-    tryCatch({
-      save_artifact_map()
-    }, error = function(e) {
-      logger.info("Artifact save failed on apply: %s", e$message)
-    })
     
     current(d_applied)
-    logger.info("Apply ok -> locked rows=%d", nrow(d_applied))
+    logger.info("Apply ok so locked ", nrow(d_applied))
     
   }, ignoreInit = TRUE)
   
@@ -289,7 +293,7 @@ shinyModule <- function(input, output, session, data) {
     d <- locked_data() %||% selected_data()
     
     if (is.null(d) || nrow(d) == 0) {
-      logger.info("mmap: empty -> base map only")
+      logger.info("mmap: empty so base map only")
       return(leaflet() %>% addProviderTiles("OpenStreetMap"))
     }
     
@@ -300,7 +304,10 @@ shinyModule <- function(input, output, session, data) {
     pal <- colorFactor(palette = pals::glasbey(), domain = ids)
     
     d$col <- pal(as.character(d[[track_col]]))
+    
+    # keep this: only selected track attrs are converted to event level for popup
     if (length(attr_sel)) d <- as_event(d, attr_sel)
+    
     d$popup_html <- make_popup(d, track_col, attr_sel)
     
     bounds <- as.vector(sf::st_bbox(d))
@@ -338,12 +345,18 @@ shinyModule <- function(input, output, session, data) {
     mmap()
   })
   
+  ############## tracks json friendly format list
+  observe({
+    vals <- input$animals %||% character(0)
+    updateTextInput(session, "animals_json", value = jsonlite::toJSON(vals, auto_unbox = FALSE))
+  })
+  #####
   
   #### download HTML
   output$save_html <- downloadHandler(
     filename = function() paste0("LeafletMap_", Sys.Date(), ".html"),
     content = function(file) {
-      logger.info("Download HTML -> %s", file)
+      logger.info("Download HTML", file)
       saveWidget(isolate(mmap()), file = file, selfcontained = TRUE)
     }
   )
@@ -352,7 +365,7 @@ shinyModule <- function(input, output, session, data) {
   output$save_png <- downloadHandler(
     filename = function() paste0("LeafletMap_", Sys.Date(), ".png"),
     content = function(file) {
-      logger.info("Download PNG -> %s", file)
+      logger.info("Download PNG", file)
       html_file <- tempfile(fileext = ".html")
       saveWidget(isolate(mmap()), file = html_file, selfcontained = TRUE)
       Sys.sleep(2)
