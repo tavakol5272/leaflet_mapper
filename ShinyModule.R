@@ -356,20 +356,24 @@ shinyModule <- function(input, output, session, data) {
   output$save_html <- downloadHandler(
     filename = function() paste0("LeafletMap_", Sys.Date(), ".html"),
     content = function(file) {
+      shinybusy::show_modal_spinner(spin = "fading-circle", text = "Saving HTML…")
+      on.exit(shinybusy::remove_modal_spinner(), add = TRUE)
       logger.info("Download HTML", file)
       saveWidget(isolate(mmap()), file = file, selfcontained = TRUE)
     }
   )
   
-  #### save map as PNG
+  
+  ### save map as PNG
   output$save_png <- downloadHandler(
-    filename = function() paste0("LeafletMap_", Sys.Date(), ".png"),
+    filename = function() paste0("LeafletMap__", Sys.Date(), ".png"),
     content = function(file) {
-      logger.info("Download PNG", file)
-      html_file <- tempfile(fileext = ".html")
+      shinybusy::show_modal_spinner(spin = "fading-circle", text = "Saving PNG…")
+      on.exit(shinybusy::remove_modal_spinner(), add = TRUE)
+      html_file <- "leaflet_export.html"
       saveWidget(isolate(mmap()), file = html_file, selfcontained = TRUE)
       Sys.sleep(2)
-      webshot(url = html_file, file = file, vwidth = 1000, vheight = 800)
+      webshot2::webshot( url = html_file,file = file,vwidth = 1000, vheight = 800      )
     }
   )
   
