@@ -164,10 +164,22 @@ shinyModule <- function(input, output, session, data) {
   all_ids_vec <- sort(unique(as.character(data[[track_col]])))
   if (!length(all_ids_vec)) logger.info(" no track ids found!")
   
+  
+  applied_animals <- reactiveVal(NULL)
+  init_applied <- reactiveVal(FALSE)
+  
+  observeEvent(input$animals, {
+    req(!is.null(input$animals))
+    applied_animals(as.character(input$animals))
+    init_applied(TRUE)
+  }, ignoreInit = FALSE)
+  
   selected_data <- reactive({
-    sel <- input$animals
-    if (is.null(sel)) sel <- all_ids_vec
-    if (!length(sel)) return(data[0, ])
+    req(init_applied())
+    
+    sel <- applied_animals()
+    if (is.null(sel) || !length(sel)) return(data[0, ])
+    
     d <- data[data[[track_col]] %in% sel, ]
     d
   })
@@ -212,19 +224,18 @@ shinyModule <- function(input, output, session, data) {
   ## initialize
   init_done <- reactiveVal(FALSE)
   
-  observeEvent(input$animals, {
+  observe({
     if (isTRUE(init_done())) return()
-    if (is.null(input$animals)) return()
+    req(init_applied())
     
     d0 <- selected_data()
     if (nrow(d0) == 0) return()
     
     locked_data(d0)
     locked_settings(list(
-      animals = input$animals,
+      animals = applied_animals(),
       select_attr = input$select_attr %||% character(0)
     ))
-    
     
     tryCatch({
       save_artifact_map()
@@ -233,21 +244,22 @@ shinyModule <- function(input, output, session, data) {
     })
     
     current(d0)
-    
     init_done(TRUE)
+    
     logger.info("INIT done , locked rows=%d , animals=%d , attrs=%d",
-                nrow(d0), length(input$animals), length(input$select_attr %||% character(0)))
-  }, ignoreInit = FALSE)
+                nrow(d0), length(applied_animals()), length(input$select_attr %||% character(0)))
+  })
   
   # keep attr selection valid when animals change
-  observeEvent(input$animals, {
+  observe({
+    req(init_applied())
+    
     d <- selected_data()
     if (nrow(d) == 0) {
       logger.info("Animals changed so empty selection.")
       return()
     }
     
-    # CHANGED: no full as_event() conversion here either
     choices <- get_attr_choices(d)
     
     prev <- isolate(input$select_attr) %||% character(0)
@@ -255,7 +267,7 @@ shinyModule <- function(input, output, session, data) {
     
     logger.info("updateSelectInput(select_attr) ,choices=%d , keep_selected=%d", length(choices), length(sel))
     updateSelectInput(session, "select_attr", choices = choices, selected = sel)
-  }, ignoreInit = FALSE)
+  })
   
   # Apply button locks what the map shows
   observeEvent(input$apply_btn, {
@@ -346,10 +358,10 @@ shinyModule <- function(input, output, session, data) {
   })
   
   ############## tracks json friendly format list
-  observe({
-    vals <- input$animals %||% character(0)
+  observeEvent(input$animals, {
+    vals <- as.character(input$animals %||% character(0))
     updateTextInput(session, "animals_json", value = jsonlite::toJSON(vals, auto_unbox = FALSE))
-  })
+  }, ignoreInit = TRUE)
   #####
   
   #### download HTML
