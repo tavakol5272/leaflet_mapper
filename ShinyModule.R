@@ -158,6 +158,7 @@ shinyModule <- function(input, output, session, data) {
   }
   
   if (!sf::st_is_longlat(data)) data <- sf::st_transform(data, 4326)
+  current(data)
   
   track_col <- mt_track_id_column(data)
   
@@ -243,7 +244,7 @@ shinyModule <- function(input, output, session, data) {
       logger.info("Artifact save failed on init: %s", e$message)
     })
     
-    current(d0)
+    current(data)
     init_done(TRUE)
     
     logger.info("INIT done , locked rows=%d , animals=%d , attrs=%d",
@@ -288,8 +289,8 @@ shinyModule <- function(input, output, session, data) {
     ))
     
     
-    current(d_applied)
-    logger.info("Apply ok so locked ", nrow(d_applied))
+    current(data)
+    logger.info("Apply ok so locked %d rows", nrow(d_applied))
     
   }, ignoreInit = TRUE)
   
@@ -370,7 +371,7 @@ shinyModule <- function(input, output, session, data) {
     content = function(file) {
       shinybusy::show_modal_spinner(spin = "fading-circle", text = "Saving HTML…")
       on.exit(shinybusy::remove_modal_spinner(), add = TRUE)
-      logger.info("Download HTML", file)
+      logger.info("Download HTML %s", file)
       saveWidget(isolate(mmap()), file = file, selfcontained = TRUE)
     }
   )
